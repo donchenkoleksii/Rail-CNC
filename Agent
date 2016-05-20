@@ -1,0 +1,127 @@
+
+function requestHandler(request, response) {
+    try {
+        // Check if the user sent led as a query parameter
+        if ("relay" in request.query) {
+            // If they did, and led=1.. set our variable to 1
+            if (request.query.relay == "1" || request.query.relay == "0") {
+                // Convert the led query parameter to an integer
+                local relayState = request.query.relay.tointeger();
+
+                // Send "set.led" message to device, and send ledState as the data
+                device.send("set.relay", relayState); 
+            }
+            response.send(200, "OK");
+        }
+        else if ("pan" in request.query) {
+            // If they did, and led=1.. set our variable to 1
+                // Convert the led query parameter to an integer
+                local panState = request.query.pan.tointeger();
+
+                // Send "set.led" message to device, and send ledState as the data
+                device.send("set.pan", panState); 
+            response.send(200, "OK");
+        }
+        else if ("tilt" in request.query) {
+            // If they did, and led=1.. set our variable to 1
+                // Convert the led query parameter to an integer
+                local tiltState = request.query.tilt.tointeger();
+
+                // Send "set.led" message to device, and send ledState as the data
+                device.send("set.tilt", tiltState); 
+                http.post("http://lgbeno.analog.io:1880/mqtt",{ "Content-Type" : "text/xml" },"Tilt is set to "+tiltState).sendsync();
+          response.send(200, "OK");
+        }
+        else if ("uart" in request.query) {
+            // If they did, and led=1.. set our variable to 1
+                // Convert the led query parameter to an integer
+                local msg = request.query.msg;
+
+                // Send "set.led" message to device, and send ledState as the data
+                device.send("send.uart", msg); 
+                response.send(200, "OK");
+        }
+        else if (request.path=="/uart") {
+          device.send("send.uart", request.body);
+          response.send(200, "OK");
+        }
+        
+        else if (request.path=="/move_fwd") {
+          device.send("move.fwd", request.body);
+          response.send(200, "OK");
+        }
+        else if (request.path=="/move_rev") {
+          device.send("move.rev", request.body);
+          response.send(200, "OK");
+        }
+        else if (request.path=="/stop") {
+          device.send("move.stop", request.body);
+          response.send(200, "OK");
+        }
+        else if (request.path=="/goto") {
+          if ("pos" in request.query) {
+                local position = request.query.pos.tointeger();
+                device.send("move.goto", position); 
+            }
+          response.send(200, "OK");
+        }
+        
+        else if (request.path=="/carrier") {
+          if ("freq" in request.query) {
+                device.send("set.carrier", request.query.freq); 
+          }
+          device.send("move.stop", request.body);
+          response.send(200, "OK");
+        }
+        
+        else if (request.path=="/position") {
+          // Blocking wait to receive response from the imp
+          device.send("get.position", 1); 
+          device.on("position.response", function(data) {
+            response.send(200,data);
+          });
+        }
+        
+        else if (request.path=="/is_moving") {
+          // Blocking wait to receive response from the imp
+          device.send("get.is_moving", 1); 
+          device.on("is_moving.response", function(data) {
+            response.send(200,data);
+          });
+        }
+        
+        else if (request.path=="/query") {
+          // Blocking wait to receive response from the imp
+          local cmd = request.query.cmd;
+          device.send("uart.cmd", cmd); 
+          device.on("uart.response", function(data) {
+            response.send(200,data);
+          });
+        }
+        // Send a response back to the browser saying everything was OK.\
+        else {
+            //response.send(200,page);
+        }
+        
+    } catch (ex) {
+        response.send(500, "Internal Server Error: " + ex);
+    }
+}
+
+function uart_data_rx(msg) {
+    http.post("http://lgbeno.analog.io:1880/mqtt",{ "Content-Type" : "text/xml" },msg).sendsync();
+}
+
+function uart_read_response(read) {
+  device.send("send.uart", read);
+  device.on("uart_data", function(data) {
+    server.log("response: "+data);
+  });
+  device.on("uart_data",uart_data_rx)
+}
+
+http.post("http://lgbeno.analog.io:1880/mqtt",{ "Content-Type" : "text/xml" },"Device has booted").sendsync();
+
+// Register the HTTP handler to begin watching for HTTP requests from your browser
+http.onrequest(requestHandler);
+device.on("uart_data",uart_data_rx)
