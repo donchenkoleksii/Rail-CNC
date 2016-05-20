@@ -1,0 +1,873 @@
+tilt <- hardware.pin9;
+pan <- hardware.pinC;
+
+relay <- hardware.pin8;
+
+// Stepper Motor Signals
+spi <- hardware.spi257;
+cs_l <- hardware.pinD;
+rst_l <- hardware.pinA;
+flag_l <- hardware.pinB;
+
+uart <- hardware.uart6E
+
+
+local waiting_for_response = false
+local large_buffer = ""
+local STEPS_DEVIDER
+ 
+// L6470 "dSPIN" stepper motor driver IC
+// http://www.st.com/st-web-ui/static/active/en/resource/technical/document/datasheet/CD00255075.pdf
+
+// Consts and Globals ---------------------------------------------------------
+const SPICLK = 1000; // kHz
+const MOTOR_STEPS_PER_REV = 200; // using sparkfun's small stepper motor
+const NUMBEROF_TEETH_TIMING_BELT_GEAR = 16;
+
+
+// The following constants are all associated with the L6470 class
+// these are consts outside the class so that we can use them in motor configuration
+// and for performance reasons
+const CONFIG_PWMDIV_1      = 0x0000;
+const CONFIG_PWMDIV_2      = 0x2000;
+const CONFIG_PWMDIV_3      = 0x4000;
+const CONFIG_PWMDIV_4      = 0x5000;
+const CONFIG_PWMDIV_5      = 0x8000;
+const CONFIG_PWMDIV_6      = 0xA000;
+const CONFIG_PWMDIV_7      = 0xC000;
+const CONFIG_PWMMULT_0_625 = 0x0000;
+const CONFIG_PWMMULT_0_750 = 0x0400;
+const CONFIG_PWMMULT_0_875 = 0x0800;
+const CONFIG_PWMMULT_1_000 = 0x0C00;
+const CONFIG_PWMMULT_1_250 = 0x1000;
+const CONFIG_PWMMULT_1_500 = 0x1400;
+const CONFIG_PWMMULT_1_750 = 0x1800;
+const CONFIG_PWMMULT_2_000 = 0x1C00;
+const CONFIG_SR_320        = 0x0000;
+const CONFIG_SR_75         = 0x0100;
+const CONFIG_SR_110        = 0x0200;
+const CONFIG_SR_260        = 0x0300;
+const CONFIG_INT_OSC       = 0x0000;
+const CONFIG_OC_SD         = 0x0080;
+const CONFIG_VSCOMP        = 0x0020;
+const CONFIG_SW_USER       = 0x0010;
+const CONFIG_EXT_CLK       = 0x0008;
+
+const STEP_MODE_SYNC    = 0x80;
+const STEP_SEL_FULL     = 0x00;
+const STEP_SEL_HALF     = 0x01;
+const STEP_SEL_1_4      = 0x02;
+const STEP_SEL_1_8      = 0x03;
+const STEP_SEL_1_16     = 0x04;
+const STEP_SEL_1_32     = 0x05;
+const STEP_SEL_1_64     = 0x06;
+const STEP_SEL_1_128    = 0x07;
+
+const CMD_NOP		 	= 0x00;
+const CMD_GOHOME		= 0x70;
+const CMD_GOMARK		= 0x78;
+const CMD_GOTO          = 0x60;
+const CMD_GOTO_DIR      = 0x68;
+const CMD_GO_UNTIL      = 0x82;
+const CMD_RESET_POS	    = 0xD8;
+const CMD_RESET		    = 0xC0;
+const CMD_RUN           = 0x50;
+const CMD_SOFT_STOP	    = 0xB0;
+const CMD_HARD_STOP	    = 0xB8;
+const CMD_SOFT_HIZ		= 0xA0;
+const CMD_HARD_HIZ		= 0xA8;
+const CMD_GETSTATUS	    = 0xD0;	 
+const CMD_GETPARAM      = 0x20;
+const CMD_SETPARAM      = 0x00;
+const CMD_MOVE        = 0x40;
+
+const REG_ABS_POS 		= 0x01;
+const REG_EL_POS 		= 0x02;
+const REG_MARK			= 0x03;
+const REG_SPEED		    = 0x04;
+const REG_ACC			= 0x05;
+const REG_DEC			= 0x06;
+const REG_MAX_SPD 		= 0x07;
+const REG_MIN_SPD 		= 0x08;
+const REG_KVAL_HOLD 	= 0x09;
+const REG_KVAL_RUN 	    = 0x0A;
+const REG_KVAL_ACC 	    = 0x0B;
+const REG_KVAL_DEC 	    = 0x0C;
+const REG_INT_SPD		= 0x0D;
+const REG_ST_SLP		= 0x0E;
+const REG_FN_SLP_ACC	= 0x0F;
+const REG_FN_SLP_DEC	= 0x10;
+const REG_K_THERM		= 0x11;
+const REG_ADC_OUT		= 0x12;
+const REG_OCD_TH		= 0x13;
+const REG_STALL_TH		= 0x13;
+const REG_STEP_MODE	    = 0x14;
+const REG_FS_SPD		= 0x15;
+const REG_STEP_MODE 	= 0x16;
+const REG_ALARM_EN		= 0x17;
+const REG_CONFIG 		= 0x18;
+const REG_STATUS 		= 0x19;
+
+class L6470 {
+	spi 	= null;
+	cs_l 	= null;
+	rst_l 	= null;
+	flag_l	= null;
+	
+	// full-step speed
+	fs_speed = null;
+
+    // defined before constructor because this function is used as a callback for the flag pin
+	function handleFlag() {
+		if (!flag_l.read()) { server.log("L6470 set flag"); }
+		else { server.log("L6470 unset flag"); }
+		  server.log("------------------Status------------------")
+		  local status = getStatus();
+		  if ((status & 0x0001) != 0) {server.log("Hi Z Mode")}
+		  if ((status & 0x0002) != 0) {server.log("Busy")}
+		  if ((status & 0x0004) != 0) {server.log("SW_F")}
+		  if ((status & 0x0008) != 0) {server.log("Switch Event")}
+		  if ((status & 0x0010) != 0) {server.log("Direction: Forward")}
+		  else {server.log("Direction: Backward")}
+		  if ((status & 0x0060) == 0x0000){server.log("Motor Stopped")} //00
+		  if ((status & 0x0060) == 0x0020) {server.log("Motor Accelerating")} //01
+		  if ((status & 0x0060) == 0x0040) {server.log("Motor Decelerating")} //10
+		  if ((status & 0x0060) == 0x0060) {server.log("Motor Moving at Constant Speed")} //11
+		  if ((status & 0x0080) != 0) {server.log("CMD not performed")}
+		  if ((status & 0x0100) != 0) {server.log("CMD does not exist")}
+		  if ((status & 0x0200) == 0) {server.log("Undervoltage Lockout")}
+		  if ((status & 0x0400) == 0) {server.log("Thermal Warning")}
+		  if ((status & 0x0800) == 0) {server.log("Thermal Shutdown")}
+		  if ((status & 0x1000) == 0) {server.log("Over Current Detect")}
+		  if ((status & 0x2000) == 0) {server.log("Winding A Stall Detected")}
+		  if ((status & 0x4000) == 0) {server.log("Winding B Stall Detected")}
+		  if ((status & 0x8000) != 0) {server.log("Device in Step Clock Mode")}
+        server.log(format("Status Register: 0x%04x", status));
+	}
+
+	constructor(_spi, _cs_l, _rst_l, _flag_l) {
+		this.spi 	= _spi;
+		this.cs_l 	= _cs_l;
+		this.rst_l 	= _rst_l;
+		this.flag_l = _flag_l;
+
+		cs_l.write(1);
+		rst_l.write(1);
+		// re-configure pin to assign callback
+		flag_l.configure(DIGITAL_IN, handleFlag.bindenv(this));
+	
+		reset();
+	}
+
+	function reset() {
+		rst_l.write(0);
+		imp.sleep(0.001);
+		rst_l.write(1);
+		
+		// device comes out of reset with overcurrent bit set in status register
+        // read the register to clear the bit.
+        getStatus();
+	}
+	
+	// helper function: read up to four bytes from the device
+	// no registers in the L6470 are more than four bytes wide
+	// returns an integer
+	function read(num_bytes) {
+	    local result = 0;
+	    for (local i = 0; i < num_bytes; i++) {
+	        cs_l.write(0);
+	        result += ((spi.writeread(format("%c",CMD_NOP))[0].tointeger() & 0xff) << (8 * (num_bytes - 1 - i)));
+	        cs_l.write(1);
+	    }
+	    return result;
+	}
+	
+	// helper function: write an arbitrary length value to the device
+	// Input: data as a string. Use format("%c",byte) to prepare to write with this function
+	// Returns an string containing the data read back as this data is written out
+	function write(data) {
+	    local num_bytes = data.len();
+	    local result = 0;
+	    for (local i = 0; i < num_bytes; i++) {
+	        cs_l.write(0);
+	        result += ((spi.writeread(format("%c",data[i]))[0].tointeger() & 0xff) << (8 * (num_bytes - 1 - i)));
+	        cs_l.write(1);
+	    }
+	    return result;
+	}
+	
+	// read the L6470 status register
+	// Input: None
+	// Return: 2-byte status register value (integer)
+	function getStatus() {
+		write(format("%c",CMD_GETSTATUS));
+		return read(2);
+	}
+	
+	// write the L6470 config register
+	// Input: new 2-byte value (integer)
+	// Return: None
+	function setConfig(val) {
+	    write(format("%c", CMD_SETPARAM | REG_CONFIG));
+	    write(format("%c%c", ((val & 0xff00) >> 8), (val & 0xff)));
+	}
+	
+	// read the L6470 config register
+	// Input: None
+	// Return: 2-byte config register value (integer)
+	function getConfig() {
+	    write(format("%c",CMD_GETPARAM | REG_CONFIG));
+		return read(2);
+	}
+	
+	function setParam8(param,val) {
+	    write(format("%c", CMD_SETPARAM | param));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	function setParam16(param,val) {
+	    write(format("%c", CMD_SETPARAM | param));
+	    write(format("%c%c", ((val & 0xff00) >> 8), (val & 0xff)));
+	}
+	
+	
+	// configure the microstepping mode
+	// OR STEP_MODE consts together to generate new value
+	// Input: New (1-byte) step mode (integer)
+	// Return: None
+
+	function setStepMode(val) {
+	    STEPS_DEVIDER = 1 << val;
+	    write(format("%c", CMD_SETPARAM | REG_STEP_MODE));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// read the current microstepping mode
+	// Input: None
+	// Return: 1-byte step mode register value (integer)
+	function getStepMode() {
+	    write(format("%c",CMD_GETPARAM | REG_STEP_MODE));
+		return read(1);
+	}
+	
+	// set the minimum motor speed in steps per second
+	// this will generate different angular speed depending on the number of steps per rotation in your motor
+	// device comes out of reset with min speed set to zero
+	// Input: new min speed in steps per second (integer)
+	// Return: None
+	function setMinSpeed(stepsPerSec) {
+	    local val = math.ceil(stepsPerSec * 0.065536).tointeger();
+	    if (val > 0x03FF) { val = 0x03FF; }
+	    write(format("%c", CMD_SETPARAM | REG_MIN_SPD));
+	    write(format("%c%c", ((val & 0xff00) >> 8), (val & 0xff)));
+	}
+	
+	
+	// read the current minimum speed setting
+	// Input: None
+	// Return: Min speed in steps per second (integer)
+	function getMinSpeed() {
+	    write(format("%c",CMD_GETPARAM | REG_MIN_SPD));
+		local minspeed = read(2);
+		minspeed = math.ceil((1.0 * minspeed) / 0.065536);
+		return minspeed;
+	}
+	
+	// set the maximum motor speed in steps per second
+	// this will generate different angular speed depending on the number of steps per rotation in your motor
+	// Input: new max speed in steps per second (integer)
+	// Return: None
+	function setMaxSpeed(stepsPerSec) {
+	    local val = math.ceil(stepsPerSec * 0.065536).tointeger();
+	    if (val > 0x03FF) { val = 0x03FF; }
+	    write(format("%c", CMD_SETPARAM | REG_MAX_SPD));
+	    write(format("%c%c", ((val & 0xff00) >> 8), (val & 0xff)));
+	}
+	
+	function setStallThresh(stallThreshold) {
+	    local val = math.ceil(stallThreshold / 0.03125).tointeger();
+	    if (val > 0x7F) { val = 0x7F; }
+	    write(format("%c", CMD_SETPARAM | REG_STALL_TH));
+	    write(format("%c", (val & 0x7f)));
+	}
+	
+	// read the current maximum speed setting
+	// Input: None
+	// Return: Max speed in steps per second (integer)
+	function getMaxSpeed() {
+	    write(format("%c",CMD_GETPARAM | REG_MAX_SPD));
+		local maxspeed = read(2);
+		maxspeed = math.ceil((1.0 * maxspeed) / 0.065536);
+		return maxspeed;
+	}
+	
+	// set the full-step motor speed in steps per second
+	// Input: new full-step speed in steps per second (integer)
+	// Return: None
+	function setFSSpeed(stepsPerSec) {
+	    local val = math.ceil((stepsPerSec * 0.065536) - 0.5).tointeger();
+	    if (val > 0x03FF) { val = 0x03FF; }
+	    fs_speed = val;
+	    write(format("%c", CMD_SETPARAM | REG_FS_SPD));
+	    write(format("%c%c", ((val & 0xff00) >> 8), (val & 0xff)));
+	}
+	
+	// read the current full-step speed setting
+	// Input: None
+	// Return: full-step speed in steps per second (integer)
+	function getFSSpeed() {
+	    write(format("%c",CMD_GETPARAM | REG_FS_SPD));
+		local fsspeed = read(2);
+		fsspeed = math.ceil((1.0 * fsspeed) / 0.065536);
+		return fsspeed;
+	}
+	
+	// set max acceleration in steps/sec^2
+	// Input: integer
+	// Return: None.
+	function setAcc(stepsPerSecPerSec) {
+	    local val = math.ceil(stepsPerSecPerSec * 0.137438).tointeger();
+        if (val > 0x0FFF) { val = 0x0FFF; }
+	    write(format("%c", CMD_SETPARAM | REG_ACC));
+	    write(format("%c%c", ((val & 0xff00) >> 8), (val & 0xff)));
+	}
+	
+	// set max deceleration in steps/sec^2
+	// Input: integer
+	// Return: None.
+	function setDec(stepsPerSecPerSec) {
+	    local val = math.ceil(stepsPerSecPerSec * 0.137438).tointeger();
+        if (val > 0x0FFF) { val = 0x0FFF; }
+	    write(format("%c", CMD_SETPARAM | REG_DEC));
+	    write(format("%c%c", ((val & 0xff00) >> 8), (val & 0xff)));
+	}
+	
+	// set overcurrent threshold value
+	// thresholds are set at 375 mA intervals from 375 mA to 6A
+	// Input: threshold in mA (integer)
+	// Return: None
+	function setOcTh(threshold) {
+	    local val = math.floor(threshold / 375).tointeger();
+        if (val > 0x0f) { val = 0x0f; }
+	    write(format("%c", CMD_SETPARAM | REG_OCD_TH));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// Set Vs compensation factor for hold state
+	// Input: new 1-byte compensation factor (integer)
+	// Return: None
+	function setHoldKval(val) {
+	    write(format("%c", CMD_SETPARAM | REG_KVAL_HOLD));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// Get Vs compensation factor for hold state
+	// Input: None
+	// Return: 1-byte value (integer)
+	function getHoldKval() {
+	    write(format("%c", CMD_GETPARAM | REG_KVAL_HOLD));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// Set Vs compensation factor for run state
+	// Input: new 1-byte compensation factor (integer)
+	// Return: None
+	function setRunKval(val) {
+	    write(format("%c", CMD_SETPARAM | REG_KVAL_RUN));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// Get Vs compensation factor for run state
+	// Input: None
+	// Return: 1-byte value (integer)	
+	function getRunKval() {
+	    write(format("%c", CMD_GETPARAM | REG_KVAL_RUN));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// Set Vs compensation factor for acceleration state
+	// Input: new 1-byte compensation factor (integer)
+	// Return: None	
+	function setAccKval(val) {
+	    write(format("%c", CMD_SETPARAM | REG_KVAL_ACC));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// Get Vs compensation factor for acceleration state
+	// Input: None
+	// Return: 1-byte value (integer)
+	function getAccKval() {
+	    write(format("%c", CMD_GETPARAM | REG_KVAL_ACC));
+	    write(format("%c", (val & 0xff)));
+	}	
+
+	// Set Vs compensation factor for deceleration state
+	// Input: new 1-byte compensation factor (integer)
+	// Return: None	
+	function setDecKval(val) {
+	    write(format("%c", CMD_SETPARAM | REG_KVAL_DEC));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// Get Vs compensation factor for deceleration state
+	// Input: None
+	// Return: 1-byte value (integer)
+	function getDecKval() {
+	    write(format("%c", CMD_GETPARAM | REG_KVAL_DEC));
+	    write(format("%c", (val & 0xff)));
+	}
+	
+	// Set current motor absolute position counter
+	// unit value is equal to the current step mode (full, half, quarter, etc.)
+	// position range is -2^21 to (2^21) - 1 microsteps
+	// Input: 22-bit absolute position counter value (integer)
+	// Return: None
+	function setAbsPos(pos) {
+        write(format("%c%c%c%c", CMD_SETPARAM | REG_ABS_POS, (pos & 0xff0000) >> 16, (pos & 0xff00) >> 8, pos & 0xff));
+	}
+	
+	// Get current motor absolute position counter
+	// unit value is equal to the current step mode (full, half, quarter, etc.)
+	// position range is -2^21 to (2^21) - 1 microsteps
+	// Input: None
+	// Return: 22-bit value (integer)
+	function getAbsPos() {
+	    write(format("%c", CMD_GETPARAM | REG_ABS_POS));
+	    return read(3);
+	}
+	
+	// Set current motor electrical position 
+	// Motor will immediately move to this electrical position
+	// Electrical position is a 9-bit value
+	// Bits 8 and 7 indicate the current step
+	// Bits 6:0 indicate the current microstep
+	// Input: new electrical position value (integer)
+	// Return: None
+	function setElPos(pos) {
+        write(format("%c%c%c", CMD_SETPARAM | REG_EL_POS, (pos & 0x0100) >> 8, pos & 0xff));
+	}
+	
+	// Get current motor electrical position 
+	// Input: None
+	// Return: current 9-bit electrical position value (integer)
+	function getElPos() {
+	    write(format("%c", CMD_GETPARAM | REG_EL_POS));
+	    return read(2);
+	}
+	
+	// Set the absolute position mark register
+	// Mark is a 22-bit value
+	// Units match the current step unit (full, half, quarter, etc.)
+	// Values range from -2^21 to (2^21) - 1 in microsteps
+	// Input: New 22-bit position mark value (integer)
+	// Return: None
+	function setMark(pos) {
+        write(format("%c%c%c%c", CMD_SETPARAM | REG_MARK, (pos & 0xff0000) >> 16, (pos & 0xff00) >> 8, pos & 0xff));
+	}
+	
+	// Get the absolute position mark register
+	// Input: None
+	// Return: 22-bit position mark value (integer)
+	function getMark() {
+	    write(format("%c", CMD_GETPARAM | REG_MARK));
+	    return read(3);
+	}
+
+    // Immediately disable the power bridges and set the coil outputs to high-impedance state
+    // This will raise the HiZ flag, if enabled
+    // This command holds the BUSY line low until the motor is stopped
+    // Input: None
+    // Return: None
+	function hardHiZ() {
+	    write(format("%c", CMD_HARD_HIZ));
+	}
+	
+	// Decelerate the motor to zero, then disable the power bridges and set the 
+	// coil outputs to high-impedance state
+	// The HiZ flag will be raised when the motor is stopped
+	// This command holds the BUSY line low until the motor is stopped
+	// Input: None
+	// Return: None
+	function softHiZ() {
+	    write(format("%c", CMD_SOFT_HIZ));
+	}
+	
+    // Move the motor immediately to the HOME position (zero position marker)
+    // The motor will take the shortest path
+    // This is equivalent to using GoTo(0) without a direction
+    // If a direction is mandatory, use GoTo and specify a direction
+    // Input: None
+    // Return: None
+	function goHome() {
+	    write(format("%c", CMD_GOHOME));
+	}
+	
+	// Move the motor immediately to the MARK position
+	// MARK defaults to zero
+	// Use setMark to set the mark position register
+	// The motor will take the shortest path to the MARK position
+	// If a direction is mandatory, use GoTo and specify a direction
+	// Input: None
+	// Return: None
+	function goMark() {
+	    write(format("%c", CMD_GOMARK));
+	}
+	
+    //The GoUntil command produces a motion at SPD speed imposing a forward (DIR = '1') or
+    //a reverse (DIR = '0') direction. When an external switch turn-on event occurs (see
+    //Section 6.13 on page 31), the ABS_POS register is reset (if ACT = '0') or the ABS_POS
+    //register value is copied into the MARK register (if ACT = '1'); then the system performs a
+    //SoftStop command.
+	function goUntil(act=1,dir=1,spd=0) {
+	    local cmd = CMD_GO_UNTIL;
+	    if (dir == 1) { cmd = cmd | 0X01; }//forward
+	    if (act == 1) { cmd = cmd | 0X08; }
+		if (!spd) { spd = fs_speed; }
+	    else {
+	        spd = math.ceil((spd * 0.065536) - 0.5).tointeger();
+	        if (spd > 0x03FF) { spd = 0x03FF; }
+	    }
+	    write(format("%c%c%c", cmd, (spd & 0xff00) >> 8, spd & 0xff));
+	}
+	
+
+	
+	// Move the motor num_steps in a direction
+	// if fwd = 1, the motor will move forward. If fwd = 0, the motor will step in reverse
+	// num_steps is a 22-bit value specifying the number of steps; units match the current step mode.
+	// Input: fwd (0 or 1), num_steps (integer)
+	// Return: None
+	function move(fwd, num_steps) {
+	    local cmd = CMD_MOVE;
+	    if (fwd) { cmd = CMD_RUN | 0X01; }
+	    write(format("%c%c%c%c", cmd, (num_steps & 0xff0000) >> 16, (num_steps & 0xff00) >> 8, num_steps & 0xff));
+	}
+	
+	// Move the motor to a position
+	// Position is a 22-bit value. Units match the current step mode.
+	// Direction is 1 for forward, 0 for reverse
+	// If a direction not provided, the motor will take the shortest path
+	// Input: Position (integer), [direction (integer)]
+    // Return: None
+	function goTo(pos, dir = null) {
+	    local cmd = CMD_GOTO;
+	    if (dir != null) {
+	        if (dir == 0) {
+    	        cmd = CMD_GOTO_DIR;
+	        } else {
+	            cmd = CMD_GOTO_DIR | 0x01;
+	        }
+	    }
+	    write(format("%c%c%c%c", cmd, (pos & 0xff0000) >> 16, (pos & 0xff00) >> 8, pos & 0xff));
+	}
+	
+	// Run the motor
+	// Direction is 1 for fwd, 0 for reverse
+	// Speed is in steps per second. Angular speed will depend on the steps per rotation of your motor
+	// Input: [direction (integer)], [speed (integer)]
+	// Return: None
+	function run(fwd = 1, speed = 0) {
+	    local cmd = CMD_RUN;
+	    if (fwd) { cmd = CMD_RUN | 0x01; }
+	    if (!speed) { speed = fs_speed; }
+	    else { 
+	        speed = math.ceil((speed * 0.065536) - 0.5).tointeger();
+	        if (speed > 0x03FF) { speed = 0x03FF; }
+	    }
+	    write(format("%c%c%c", cmd, (speed & 0xff00) >> 8, speed & 0xff));
+	}
+	
+	// Soft-stop the motor. This will decelerate the motor smoothly to zero speed.
+	// Input: None
+	// Return: None
+	function stop() {
+	    write(format("%c", CMD_SOFT_STOP));
+	}
+}
+
+function dumpStatus(m) {
+		if (!flag_l.read()) { server.log("L6470 set flag"); }
+		else { server.log("L6470 unset flag"); }
+		  server.log("------------------Status------------------")
+		  local status = m.getStatus();
+		  if ((status & 0x0001) != 0) {server.log("Hi Z Mode")}
+		  if ((status & 0x0002) != 0) {server.log("Busy")}
+		  if ((status & 0x0004) != 0) {server.log("SW_F")}
+		  if ((status & 0x0008) != 0) {server.log("Switch Event")}
+		  if ((status & 0x0010) != 0) {server.log("Direction: Forward")}
+		  else {server.log("Direction: Backward")}
+		  if ((status & 0x0060) == 0x0000){server.log("Motor Stopped")} //00
+		  if ((status & 0x0060) == 0x0020) {server.log("Motor Accelerating")} //01
+		  if ((status & 0x0060) == 0x0040) {server.log("Motor Decelerating")} //10
+		  if ((status & 0x0060) == 0x0060) {server.log("Motor Moving at Constant Speed")} //11
+		  if ((status & 0x0080) != 0) {server.log("CMD not performed")}
+		  if ((status & 0x0100) != 0) {server.log("CMD does not exist")}
+		  if ((status & 0x0200) == 0) {server.log("Undervoltage Lockout")}
+		  if ((status & 0x0400) == 0) {server.log("Thermal Warning")}
+		  if ((status & 0x0800) == 0) {server.log("Thermal Shutdown")}
+		  if ((status & 0x1000) == 0) {server.log("Over Current Detect")}
+		  if ((status & 0x2000) == 0) {server.log("Winding A Stall Detected")}
+		  if ((status & 0x4000) == 0) {server.log("Winding B Stall Detected")}
+		  if ((status & 0x8000) != 0) {server.log("Device in Step Clock Mode")}
+        server.log(format("Status Register: 0x%04x", status));
+	}
+
+
+// Runtime Begins -------------------------------------------------------------
+//imp.enableblinkup(true);
+
+spi <- hardware.spi257;
+cs_l <- hardware.pinD;
+rst_l <- hardware.pinA ;
+flag_l <- hardware.pinB;
+
+spi.configure(MSB_FIRST, SPICLK);
+cs_l.configure(DIGITAL_OUT);
+rst_l.configure(DIGITAL_OUT);
+flag_l.configure(DIGITAL_IN);
+
+motor <- L6470(spi, cs_l, rst_l, flag_l);
+
+
+// 1/64 step microstepping
+motor.setStepMode(STEP_SEL_1_64); // sync disabled, pwm divisor 1, pwm multiplier 2
+	    
+//speed profile maximum speed expressed in step/tick (format unsigned fixed point 0.18)
+//The available range is from 15.25 to 15610 step/s with a resolution of 15.25 step/s.
+motor.setMaxSpeed(100); 
+
+//When the actual speed exceeds this value, the step mode is automatically switched to full-step two-phase on
+motor.setFSSpeed(1000); 
+
+//speed profile acceleration expressed in step/tick2 (format unsigned fixed point 0.40).
+//The available range is from 14.55 to 59590 step/s2 with a resolution of 14.55 step/s2
+motor.setAcc(43.65); // max
+
+//speed profile deceleration expressed in step/tick2 (format unsigned fixed point 0.40).
+//The available range is from 14.55 to 59590 step/s2 with a resolution of 14.55 step/s2
+motor.setDec(43.65); // max
+
+
+motor.setOcTh(3375); // 6A // 3375
+motor.setRunKval(29); // set Vs divisor to 1
+motor.setAccKval(29);
+motor.setDecKval(29);
+motor.setHoldKval(29);
+motor.setMinSpeed(0x00);
+
+motor.setParam8(REG_ST_SLP,127);// ST_SLP, Start slope
+motor.setParam8(REG_FN_SLP_ACC,127);//FN_SLP_ACC, Acceleration final slope
+motor.setParam8(REG_FN_SLP_DEC,127);//FN_SLP_DEC, Deceleration final slope
+
+
+function move_fwd(param){
+  server.log("moving forward")
+  motor.run(1, 6400);
+}
+
+function move_rev(param){
+  server.log("moving backward")
+  motor.run(0, 6400);
+}
+function mtr_stop(param){
+  motor.stop();
+}
+function mtr_goto(param){
+  #server.log("Moving to "+tostring(param))
+  motor.stop();
+  local pos = math.ceil((param+1)*319.677954061094).tointeger()
+  if (pos<0) {
+    motor.goTo(0);
+  }
+  if (pos>=0 && pos<=1500000) {
+    motor.goTo(4194304-pos);
+  }
+}
+
+//agent.on("move.fwd",move_fwd)
+//agent.on("move.rev",move_rev)
+//agent.on("move.stop",mtr_stop)
+//agent.on("move.goto",mtr_goto)
+
+
+local period_ms = 20.0
+local us=0.000001/(period_ms/1000)
+local us_per_deg = 1.42857142857143
+local zero  = 1500
+local ratio = 3.9//3.8
+
+local pan_cal_offset_deg  = 6
+local tilt_cal_offset_deg = 2
+
+function deg_to_us(deg) {
+  return 0.6349206349206349*deg*ratio + zero
+}
+
+
+function move_deg(axis,deg) {
+  if (deg>-180 && deg<=180) {
+    axis.write(deg_to_us(deg)*us)
+  }
+}
+
+
+pan.configure(PWM_OUT, 0.02, deg_to_us(pan_cal_offset_deg)*us);
+tilt.configure(PWM_OUT, 0.02, deg_to_us(tilt_cal_offset_deg)*us);
+ 
+function setPanState(state) {
+    move_deg(pan,state+pan_cal_offset_deg)
+}
+
+function setTiltState(state) {
+    move_deg(tilt,state+tilt_cal_offset_deg)
+}
+ 
+// Configure 'led' to be a digital output with a starting value of digital 0 (low, 0V)
+relay.configure(DIGITAL_OUT, 0);
+ 
+// Function called to turn the LED on or off
+// according to the value passed in (1 = on, 0 = off)
+function setRelayState(state) {
+    server.log("Set Relay to state: " + state);
+    if (state==1){
+      relay.write(0);
+    }
+    else {
+      relay.write(1);
+    }
+    
+}
+
+// Create a message buffer
+local msg = ""
+
+// A function that is called everytime that the UART receives a byte
+function serialRx() {
+  local i = 0
+  local c = 0
+  
+  //Pull a byte from the UART FIFO
+  local uart_blob = uart.readblob()
+  
+  for (i=0;i<uart_blob.len();i++)
+  {
+    c = uart_blob[i]
+    //server.log(c)
+    if (c==13)
+    {
+      if (waiting_for_response == false) {
+        agent.send("uart_data",msg)
+      }
+      else {
+        large_buffer = large_buffer + msg + "\n"
+      }
+      msg = ""
+    }
+    else
+    {
+      if (c>=32) {
+        msg=msg+format("%c",c);
+        if (msg=="lhtx>") {
+          agent.send("uart.response",large_buffer)
+          large_buffer = ""
+          waiting_for_response = false
+        }
+      }
+    }
+  }
+}
+
+function serialTx(data) {
+  server.log(data)
+  uart.write(data+format("%c",13)+format("%c",10))
+}
+
+function uartCmd(data) {
+  server.log("Asking: "+data)
+  uart.write(data+format("%c",13)+format("%c",10))
+  waiting_for_response = true
+  large_buffer = ""
+}
+
+function getPosition(data) {
+  agent.send("position.response",motor.getAbsPos())
+}
+
+function setCarrier(data) {
+  serialTx("param set carrier.frequency "+data)
+  imp.sleep(1)
+  serialTx("param save")
+  imp.sleep(1)
+  reboot_basestation()
+}
+
+function reboot_basestation() {
+  setRelayState(0)
+  imp.wakeup(5,function() {
+    setRelayState(1)
+  })
+}
+
+function getIsMoving(data) {
+  local status = motor.getStatus();
+  if ((status & 0x0060) == 0x0000){
+    agent.send("is_moving.response","False")
+  }
+  else {
+    agent.send("is_moving.response","True")
+  }
+}
+
+function mm_to_stp(mms){
+     
+    return (mms* (MOTOR_STEPS_PER_REV*10/NUMBEROF_TEETH_TIMING_BELT_GEAR))* STEPS_DEVIDER/10;//problem with floating value
+}
+
+
+
+// Setup hardware UART with serialRx event to receive bytes
+uart.configure(115200, 8, PARITY_NONE, 1, NO_CTSRTS, serialRx);
+//hardware.uart12.configure(38400, 8, PARITY_NONE, 1, NO_CTSRTS, serialRxN);
+
+//agent.send("log_msg","device booted: "+hardware.getdeviceid().toupper())
+
+// Register a handler for incoming "set.led" messages from the agent
+agent.on("set.relay", setRelayState);
+agent.on("set.pan", setPanState);
+agent.on("set.tilt", setTiltState);
+agent.on("send.uart", serialTx);
+agent.on("uart.cmd", uartCmd);
+agent.on("get.position", getPosition);
+agent.on("set.carrier", setCarrier);
+agent.on("get.is_moving", getIsMoving);
+
+
+
+//motor.goUntil(0,1, 500);//0mark,1forward,spd
+
+//motor.run(0, 100);
+
+
+//param <- 0;
+motor.setAbsPos(0);
+
+function sweep(){
+    //setPanState(param)
+    //setTiltState(param)
+    //param = 90 - param
+    //motor.run(0, 150);
+    server.log(format("Step coefficient: %d", STEPS_DEVIDER));
+    server.log(format("Absolute motor position: %d", motor.getAbsPos().tointeger()));
+    //motor.move(0, 50000);
+    // Call the function again (ie. loop) in half a second:
+    motor.move(1, mm_to_stp(64));
+    imp.wakeup(10, sweep);
+    
+    
+    
+}
+
+
+
+sweep();
+
